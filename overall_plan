@@ -1,0 +1,111 @@
+
+============================
+General Idea:
+============================
+Soccer is too complex a game to be able to learn purely from live robots: Reinforcement Learning
+algorithms need a lot of data to learn complex strategy (see chess, go, atari), and we simply don't have enough time on a
+full-sized terrain with 11 robots to afford to learn the high-level strategy from real-life, a simulated game
+(preferably running on GPU) is essential to learn the high-level actions of our team.
+
+Yet the low-level dynamics of our robots are likely to be complex enough that any policy we learn in-simulation will not transfer well to
+the real world unless we spend a great amount of time on making the simulation match our robots (yet even then
+small changes between individual robots would complicate things). This situation forces us to use a hybrid approach,
+we need to use individual robots to learn the simple component policies that we feed into a simulation-trained high-level system.
+These simple policies are things like "go to this location", or "dribble the ball to that location" or "shoot the ball there".
+Reward is plentiful and relatively obvious for those goals, so they shouldn't take long to learn, which makes them suitable
+for live-training. But the exact positioning of our team in response to an opponent team's position, in an environment
+where the only reward is  "1 if you win the game, 0 otherwise" would be a nightmare to learn with a live robot.
+
+Of course, before any of that we need to actually build our robots and interface with them...
+
+Qualifications for this year's Robocup close in February, by that date we would need to have produced a video
+of our robot shooting a ball, a paper detailing our contributions to the robot (citing any open-source designs we used),
+as well as paying membership fees, and if we qualify, there would be the price of going to France for 7 days this summer.
+In all likelihood we will miss qualifications for this year, and we should aim to qualify (and win) for next year.
+
+=============================
+Phase 1: Building one robot & Writing Simulation
+=============================
+0. Selection of which robot design we implement
+    - Teams from the Small-Size-League in robocup open-source their robot design. The most complete designs
+      seem to come from the Tigers-Manheim team, which open-sources all mechanics/electronic/software designs
+      since 2011, see https://www.tigers-mannheim.de/index.php?id=65
+    - Do we take wholesale all mechanical and electronic componenents? and we only make advancements to the
+      software on top of that?
+1. Cost estimation and component sourcing of a single Robot
+    - 3dPrinting plastic
+    - aluminium blocks + genmitsu cnc machine (or Nomad 3) OR custom aluminium machining cost (price dependent)
+    - custom pcb quotes
+    - electronics components
+    - soldering station
+    - motors costs and possible replacements
+    - wifi routers for communication
+2. Iterate on components/robot design needed until we get an acceptable cost
+    - needs to happen in parallel with financing plans, the component list is highly sensitive to our budget
+3. Make parts for robot
+    - setup Fusion360 with educational license on pc
+    - learn 3d printing with the CURA software and possibly learn cnc machining with CARVECO Maker software/fusion360
+    - order: custom pcb + electronics + motors + aluminium + plastic + soldering station + cnc machine + wifi routers
+    - 3d print all the plastic pieces for our robot
+    - Either machine ourselves OR order all aluminium parts
+    - learn how to solder PCBs from youtube
+4. Assemble robot
+5. load Firmware from Tigers-Manheim onto Robot and communicate with it through wifi routers
+    - write wrapper functions in python to send commands to Robot
+    - figure out how to receive data from the robot through wifi
+
+6. code toy-simulation of the game
+    - learn pytorch
+    - implement game as a discretized system of Ordinary Differential equations
+    - actions are the force directions for all 11 robots, rotational accelerations, and a "shooting" action
+    - differentiable end-to-end, so the reward is a differentiable function of the actions
+    - can run many simulations at the same time on GPU by sending all relevant tensors to GPU.
+    - visualization routines using the turtle library in python
+7. code beginner RL algorithms
+    - Learning RL: implement a few bandit algorithms
+    - Learning RL: implement Dynamic Programming on the grid world from Sutton (Generalized Policy Iteration)
+    - parametrize the policy with a linear function of observations and learn using gradient descent to maximize
+      the reward for our simulated game (which might be either number of goals, or 1.0/(distance between ball and goal)
+      to start
+    - replace the linear function in the model with a small neural network.
+    - implement q-learning and policy-gradient methods with neural networks
+
+=============================
+Phase 2: Building More robots, Learning Low-Level Control of Robot
+=============================
+0. Build More Robots
+    - print plastic, cut aluminium, order pcb/motors/chips, solder electronics and assemble more robots
+1. Setup a realistic fake-grass-patch field for our robot with a ball
+2. Setup vision system with a small camera overhead to be able to localize robot
+    - recognizes robot position from colored circles on its head and communicates to central computer
+    - localize ball on the field
+3. Implement algorithms to learn low-level control of a single robot
+    - possibly don't need RL? would classical optimal control work?
+    - Setup a somewhat enclosed environment where the robot can be left alone to learn
+    - Skills to learn on Real Robot:
+        - Movement from current position to other target position
+        - Ball acquisition: moving to ball and initiating dribbling
+        - Ball Manipulation: moving from one position to another while dribbling the ball
+        - Shooting/passing: accurately pushing the ball to a location
+4. realistic simulation
+    - Implement the correct rules of the ssl, including interfacing with the virtual-referee
+    - Make the simulated dynamics of our robots closer to the actual dynamics we see
+        - i.e. build a model for how the real robot responds to actions
+5. Implement More Complex RL algorithms for our simulated game
+    - implement AlphaZero-style Monte-Carlo-Tree-Search for our toy game
+    - optimize GPU performance
+
+=============================
+Phase 3: Live-Testing whole system, increasing robustness of policy
+=============================
+- Live-testing matches of robots on a large field
+- insuring we can interface with the official Robocup SSL game code
+- Increasing robustness to:
+    - innacurate / high-latency localization system
+    - latency in commands sent to robot
+    - opposite team has different dynamics than we expect
+    - inhomogeneity in robots' response to commands
+    - unexpected ball dynamics
+    - unexpected playing surface
+
+

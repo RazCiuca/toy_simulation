@@ -1,0 +1,23 @@
+
+The first goal is to write a small simulation of the game in pytorch, which could easily be
+ported to gpu with calls to .cuda() in pytorch. And then maybe implement an RL algorithm on that?
+
+
+We have m robots on each team, each circular with a "shooter" side attached inscribed in the circle.
+An X by Y field with goals on each side.
+
+Our actions are 2 dimensional force applied on the robot, rotational acceleration, and shooting.
+We discretize our time into delta_t slices and have actions at each time slice for every player.
+We interpolate the forces in order to have a smoother experience if we use large delta_t slices.
+In order to have much greater delta_t and less backprop depth, we can set the actions to be the current
+force as well as the derivatives of the current force.
+
+Our dynamics variables are the position and angular orientation of all robots, as well as the ball.
+we have interactions between all the players and the ball, as well as the walls of the field. This is
+a system of simultaneous ODEs that we solve using numerical methods.
+
+Everything is differentiable, so we can backpropagate through the entire game if we want and find
+partial derivatives with respect to all actions taken.
+
+Coding a small animation of the game using Turtle in python:
+https://www.geeksforgeeks.org/create-a-simple-animation-using-turtle-in-python/
