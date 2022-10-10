@@ -12,5 +12,7 @@ boilerplate code for a basic training loop
 """
 
 
+if __name__ == "__main__":
 
+    pass
 
