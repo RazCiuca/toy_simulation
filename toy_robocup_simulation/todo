@@ -1,0 +1,31 @@
+
+We have our terrain of size L_x by L_y
+n players on each team, playing K games simultaneously
+how many variables? 2*(2n + 1) : 2n players plus the ball in 2 dimensions.
+we need to compute the distances between all pairs of players.
+what functionalities do we want eventually?
+    all players repel if they get too close
+    friction from ground
+
+- For the moment
+
+
+let X = [K, 2n+1, 2] be a tensor containing the location of all players for all games, we need a tensor containing the difference
+between all elements of X for all games
+
+X_p = X.unsqueeze(2).repeat(1, 1, 2n+1, 1)
+
+X_dist = X_p - X_p.tranpose(1,2)
+
+X_norms = X_dist.norm(dim=-1)
+X_directions = X_dist/X_norms
+
+The force potential could be something like e^{-x/r}/(x-r) so that the balls repel at radius r
+
+dV(r)/dr = v(r)(-1/r - 1/(x-r))
+
+d^2 x/dt^2 = F/m = SUM( -(1/m) dV(r)/dr * X_dist)
+
+
+Forces =
+
