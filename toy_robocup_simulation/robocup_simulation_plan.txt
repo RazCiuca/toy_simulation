@@ -1,0 +1,171 @@
+
+
+================================
+Robocup Simulation Version 0: Spherical Cows in Vacuum
+================================
+
+--------------------
+Basic variables we keep track of
+--------------------
+
+We are simultaneously playing K games, each of which involves simulating 2 teams of N players each, and 1 ball.
+The game is in 2 dimensions, on a field of size L_x by L_y, therefore we have K*2*(2N+1) coordinates
+to keep track of, i.e. the 2D coordinates of all players and balls in all games. In this simulation
+we will assume that the players are completely spherically symmetric, hence we do not
+need to keep track of their orientations (we will need to relax this in future simulations)
+We also keep track of the velocities and accelerations, which are also 2-dimensional.
+
+The simulation takes place in discrete time, with a time increment variable delta_t_sim.
+At each simulation step we increment the time by delta_t_sim and increment our position
+and velocity variables according to the velocity and acceleration, respectively.
+We also implement a maximum allowable velocity
+
+position <- position + delta_t * velocity
+velocity <- velocity + delta_t * acceleration
+
+if norm(velocity) > max_velocity_norm:
+	velocity <- velocity * max_velocity_norm / norm(velocity)
+
+--------------------
+The possible actions of our players
+--------------------
+
+Our players continuously take actions corresponding to the force direction that their
+imagined wheels are pushing them. This continuous action spectrum is going to be 
+annoying to deal with, so we discretize it by saying that players can only apply force
+in 8 possible directions corresponding to integer multiples of pi/4 radians from the x-axis.
+With the additional action of no force whatsoever. Independent from the acceleration decision,
+every player decides whether to "kick" the ball at any given moment.
+Hence every player has 18 possible actions that it is continuously deciding to take. 
+
+While the simulation update is taking place every delta_t_sim seconds, we have another
+variable delta_t_action that decides the timescale of decicions. Taking decisions every
+millisecond or so would not be feasible because those decisions will be the output of a
+neural network, and that's going to take too long to compute. Of course delta_t_action
+should be some integer multiple of delta_t_sim in order not to needlessly complicate our lives.
+
+--------------------
+Computing acceleration through Interactions
+--------------------
+
+The acceleration variables are determined by the following factors, all of 
+which contribute additively to the acceleration
+
+- soft player-player and player-ball collisions
+
+	to avoid complexities involving multi-player collisions, 
+	all players continuously repel each each along the direction linking their 
+	centers, with an acceleration proportional to something like k_repul/distance^2 (just like electrons)
+	where k_repul is a constant we play with that sets the effective collision strength.
+
+	To compute the contribution of this effect on the acceleration of player i, we 
+	need to sum over the repulsion forces of all players.
+	the specific form of the distance-dependent force can trivially be played with.
+	This continuous repulsion seemlessly implements "soft" collisions between players.
+
+	(notice that this is not too much more computationally intensive than doing hard collisions
+	because we would still need to check all pairwise distances even in that case. We can't 
+	avoid an O(N^2) runtime, luckily here N=6, so we don't care)
+	
+	The same continuous repulsion happens between all players and the ball. 
+
+- player-ball "kicks"
+
+	A player "kicking" the ball is implemented as a temporary and sudden increase of the 
+	repulsive constant k_repul between that player and the ball. After a player decides to 
+	take a kicking action, k_repul will be multiplied by some factor, then decrease
+	exponentially with time. To prevent players from just always kicking the ball, all
+	kicking actions after a first one will be disregarded until k_repul drops back down
+	close to its baseline (this is equivalent to just waiting a fixed amount of time,
+	but I suspect checking k_repul is easier to implement than keeping track of 
+	time-of-last-effective_kick)
+
+	effect of kick:  	k_repul <- A * k_repul
+	effect after kick:	k_repul <- alpha * k_repul + (1-alpha) * k_repul_baseline
+
+- friction
+
+	All players and balls experience friction with the ground, which is a force
+	in the direction opposite to their motion, proportional to the gravitational
+	acceleration g. For us friction_coeff will be around 0.01 or so:
+
+	accel_x_friction = - friction_coeff * g * vel_x
+	accel_y_friction = - friction_coeff * g * vel_y
+
+- wall bouncing
+	
+	Easiest interaction. If pos_x > L_x, reverse the sign of vel_x and set pos_x = L_x,
+	If pos_x < 0, reverse vel_x and set pos_x = 0
+	Same thing for the y dimension
+
+--------------------
+Computing Who's Winning (Or, what's the reward?)
+--------------------
+
+Our real optimization goal is P(our goals > opponent's goals), we don't truly care about
+the goal difference as long as we win. But this provides extremely little feedback to our
+model. We only get a single bit of information after a full 30-minute match.
+
+In order to effectively train our decision model we need more direct feedback.
+This easiest way to do this is to reward our model whenever the ball moves closer
+to the goal. so 
+
+reward_t = -( Distance(goal, ball_pos_t) - Distance(goal, ball_pos_(t-1)) )
+
+This way the model will be rewarded every time the ball moves closer.
+Differences in any function of the distance would work, for instance the difference 
+in 1/distance(goal, ball_pos) would work better, because it would more heavily reward
+distances very close to the goal than distance close to the center of the field, but 
+it would still provide feedback even when the agent is close to the center.
+Hence:
+
+reward_t = ( 1/Distance(goal, ball_pos_t) - 1/Distance(goal, ball_pos_(t-1)) )
+
+The episode ends if Distance(goal, ball_pos) either is smaller than some constant
+
+--------------------
+Our State Space
+--------------------
+
+This is what we feed to our decision model every time we want it to make a decision:
+
+State S = The position and velocity of all agents and the ball at current time.
+This contains 4*(2N+1) variables, or 52 total variables for teams of 6 players.
+(This is not Markov, since we can obtain acceleration information by considering
+differences in velocities between timesteps, and this would bring our number of 
+variables to 104 if we include all positions and velocities at the previous timestep too)
+
+Our decisions should be invariant under permutations of the players within a team in the 
+state S. Meaning that it shouldn't matter if our state array includes player j's
+position before player i's, or vice-versa.
+
+--------------------
+Our Decision Model and Learning Procedure
+--------------------
+
+We implement Q-learning with a simple function (possibly just linear) of our State Space,
+using simple epsilon-exploration.
+
+F_w: State S -> Action A   computes Q(s, a), the expected cumulative reward of taking action
+a when in state s. So here F_w(s, a) = Q(s,a), the F_w notation just makes it clear that it's w-dependent
+
+Given this function F parametrised by some weights w, our actions are given by
+a = uniformly random with probability epsilon, argmax_a'(Q(s,a')) with probability 1-epsilon
+
+At every simulation time step we use F_w to sample the decisions of every player on both teams.
+After such a decision step, we will obtain a reward_t, and observe a new state s_(t+1), by Bellmann
+optimality, we want the following to be true:
+
+F_w(s_t, a) = r_t + argmax_a'(F_w(s_(t+1), a') ) 
+
+therefore we will set our objective in the Pytorch optim environment to be
+
+objective = (F_w(s_t, a)    -    (r_t + argmax_a'(F_w(s_(t+1), a') ) ) )**2
+
+we can average this objective over all episode time steps and all games we play simultaneously
+in order to obtain our full objective.
+
+
+
+
+

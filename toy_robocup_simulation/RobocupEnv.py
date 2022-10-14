@@ -66,7 +66,8 @@ class RobocupEnv:
 
         # physical constants
         self.g = 9.81                  # gravitational acceleration, in m/s^2
-        self.friction_coeff = 0.7      # friction coefficient between wheels and terrain, needs to be tested
+        self.friction_coeff_wheels = 0.7  # friction coefficient between wheels and terrain, needs to be tested
+        self.friction_coeff_ball = 2e-3  # friction coefficient between rolling ball and terrain
 
         # simulation constants
         self.sim_delta_t = 0.01        # simulation time-step, in seconds
@@ -76,61 +77,71 @@ class RobocupEnv:
         # Pytorch Arrays
         # =============================================
 
-        # initializing positions of first team randomly within the field
-        # self.pos_team_A is an array of size [n_games, n_players, 2], hence
-        # self.pos_team_A[i,j,1] is the y coordinate of the j-th player of the i-th game
-        self.pos_team_A = t.cat([self.L_x * t.rand(n_games, n_players, 1),
-                                 self.L_y * t.rand(n_games, n_players, 1)], dim=2)
-        self.pos_team_B = t.cat([self.L_x * t.rand(n_games, n_players, 1),
-                                 self.L_y * t.rand(n_games, n_players, 1)], dim=2)
+        # initializing positions of both teams randomly within the field
+        # self.pos_agents is an array of size [n_games, 2* n_players, 2], hence for example
+        # self.pos_agents[i,j,1] is the y coordinate of the j-th player of the i-th game
+        self.pos_agents = t.cat([self.L_x * t.rand(n_games, 2*n_players, 1),
+                                self.L_y * t.rand(n_games, 2*n_players, 1)], dim=2)
+        self.pos_ball = t.cat([self.L_x * t.rand(n_games, 1, 1), self.L_y * t.rand(n_games, 1, 1)], dim=2)
 
-        # initializing velocities and acclerations of both teams to zero
-        self.vel_team_A = t.zeros(n_games, n_players, 2)
-        self.vel_team_B = t.zeros(n_games, n_players, 2)
+        # todo: add "kick" tensor corresponding to current strength of kick
+
+        # initializing velocities and accelerations of both teams to zero
+        self.vel_agents = t.zeros(n_games, 2*n_players, 2)
+        self.vel_ball = t.zeros(n_games, 1, 2)
 
         # Initializing the accelerations to Zero
         # These are control arrays, the agent will decide what goes into them
-        self.accel_team_A = t.zeros(n_games, n_players, 2)
-        self.accel_team_B = t.zeros(n_games, n_players, 2)
-
-        # initializing the rotational position to a random angle
-        self.rot_team_A = 2.0 * t.pi * t.rand(n_games, n_players)
-        self.rot_team_B = 2.0 * t.pi * t.rand(n_games, n_players)
-
-        # initializing the rotational velocity to zero
-        self.rot_vel_team_A = t.zeros(n_games, n_players)
-        self.rot_vel_team_B = t.zeros(n_games, n_players)
-
-        # initializing the rotational acceleration to zero
-        # These are control arrays, the agent will decide what goes into them
-        self.rot_accel_team_A = t.zeros(n_games, n_players)
-        self.rot_accel_team_B = t.zeros(n_games, n_players)
-
-    def compute_forces(self):
-
-        pass
+        self.accel_agents = t.zeros(n_games, 2*n_players, 2)
+        self.accel_ball = t.zeros(n_games, 1, 2)
 
     def time_step(self, actions):
+
+        # =============================================
+        # Computing acceleration from actions tensor
+        # =============================================
 
         # =============================================
         # Position and Velocity calculations
         # =============================================
 
+        # increment position from velocity
+        self.pos_agents += self.sim_delta_t * self.vel_agents
+        self.pos_ball += self.sim_delta_t * self.vel_ball
+
+        # increment velocity from acceleration
+        self.vel_agents += self.sim_delta_t * self.accel_agents
+        self.vel_ball += self.sim_delta_t * self.accel_ball
+
         # =============================================
-        # Robot-Robot Collisions
+        # Kick force exponential decrease
         # =============================================
 
         # =============================================
-        # Robot-Ball non-shot non-dribble Collisions
+        # Ball & Robot friction dynamics
         # =============================================
 
         # =============================================
-        # Robot-Ball shot Collisions
+        # Robot-Robot Repulsion
         # =============================================
 
+        # now this is a tensor of size [n_games, 2*n_players, 2*n_players, 2]
+        # which is simply pos_agents copied 2*n_player times along dim=2
+        pos_expanded = self.pos_agents.unsqueeze(2).repeat(1, 1, 2*self.n_players, 2)
+
+        # X_dist[k, i, j] constains a tensor of size 2 with the relative position of the i-th to the j-th player
+        # in the k-th game
+        pos_diff = pos_expanded - pos_expanded.transpose(1, 2)
+
+        # todo: Compute repulsive force from position difference
+
+        # todo: add it to the acceleration tensor
+
         # =============================================
-        # Robot-Ball dribble Collisions
+        # Robot-Ball Repulsion & "kick"
         # =============================================
+
+        # todo: same thing for the the ball-ball
 
         # =============================================
         # Robot-Wall Collisions
