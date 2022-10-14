@@ -92,12 +92,21 @@ class RobocupEnv:
         self.accel_agents = t.zeros(n_games, 2*n_players, 2)
         self.accel_ball = t.zeros(n_games, 1, 2)
 
-    def time_step(self, actions):
+        # initializing arrays containing the distance between ball and goal
+        # these have shape [n_games]
+        self.ball_goal_dist_team_A = (
+                    (self.pos_ball[:, :, 0] ** 2 + (self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
+        self.ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x) ** 2 + (
+                    self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
+    def time_step(self, actions, new_action_bool=False):
         """
         :param actions:
             we assume that actions is a tensor of size [n_games, 2*n_players, 10]
             the first 9 numbers in dim=2 are a one-hot encoding of the acceleration direction, the last
             number is assumed to either be 1 or 0, corresponding to the kick decision
+        :param new_action_bool: boolean that states if we are doing a simulation step in which new actions
+            are given by the model, or not
+        :return reward_team_A, reward_team_B: the rewards both teams have accumulated since the last action was taken
         """
 
         # ==============================================================================================================
@@ -220,10 +229,12 @@ class RobocupEnv:
         # ==============================================================================================================
 
         if True:
+            # decrease acceleration in line with the velocity
             self.accel_agents -= self.friction_coeff_wheels * self.g * \
                                  self.vel_agents / t.norm(self.vel_agents, dim=2, keepdim=True)
 
-            self.accel_ball -= self.friction_coeff_ball * self.g * self.vel_ball/t.norm(self.vel_ball, dim=1, keepdim=True)
+            self.accel_ball -= self.friction_coeff_ball * self.g * \
+                               self.vel_ball/t.norm(self.vel_ball, dim=1, keepdim=True)
 
         # ==============================================================================================================
         # Robot-Wall and Ball-Wall Collisions
@@ -262,6 +273,23 @@ class RobocupEnv:
         # ==============================================================================================================
         # Ball-Goal Distance
         # ==============================================================================================================
+        # we assume the goals are at coordinates (0, L_y/2) and (L_x , L_y/2)
+        # IMPORTANT: notice that the two teams are not optimizing the same goal
+        new_ball_goal_dist_team_A = ((self.pos_ball[:, :, 0]**2 +
+                                      (self.pos_ball[:, :, 1] - self.L_y/2)**2)**0.5).squeeze()
+        new_ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x)**2 +
+                                      (self.pos_ball[:, :, 1] - self.L_y/2)**2)**0.5).squeeze()
+        assert new_ball_goal_dist_team_A.shape == t.Size([self.n_games])
+        assert new_ball_goal_dist_team_B.shape == t.Size([self.n_games])
+
+        reward_team_A = 1.0/new_ball_goal_dist_team_A - 1.0/self.ball_goal_dist_team_A
+        reward_team_B = 1.0/new_ball_goal_dist_team_A - 1.0/self.ball_goal_dist_team_A
+
+        if new_action_bool:
+            self.ball_goal_dist_team_A = new_ball_goal_dist_team_A
+            self.ball_goal_dist_team_B = new_ball_goal_dist_team_B
+
+        return reward_team_A, reward_team_B
 
     def get_episode_history(self):
         pass
