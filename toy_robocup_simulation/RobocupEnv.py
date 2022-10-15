@@ -86,6 +86,7 @@ class RobocupEnv:
     def get_state(self):
         """
         :return: should return the state suitable for passing to our model for action prediction
+
         """
         pass
 
@@ -95,7 +96,158 @@ class RobocupEnv:
     def save_episode_to_file(self):
         pass
 
-    def time_step(self, actions, new_action_bool=False, verbose=False):
+    def compute_accel_from_actions(self, actions):
+
+        assert self.accel_agents.shape == t.Size([self.n_games, 2 * self.n_players, 2])
+        assert self.accel_ball.shape == t.Size([self.n_games, 1, 2])
+
+        # we assume that the first index corresponds to not accelerating at all and the 1:9 indices correspond to
+        # directions of acceleration
+        no_accel_actions = actions[:, :, 0:1]
+        accel_actions = actions[:, :, 1:9]
+
+        # compute the implied acceleration in x for all agents
+        self.accel_agents[:, :, 0:1] += self.accel * (1.0 - no_accel_actions) * (
+            t.cos(2 * np.pi * t.argmax(accel_actions, dim=2, keepdim=True) / 8))
+
+        # compute the implied acceleration in y for all agents
+        self.accel_agents[:, :, 1:2] += self.accel * (1.0 - no_accel_actions) * (
+            t.sin(2 * np.pi * t.argmax(accel_actions, dim=2, keepdim=True) / 8))
+
+        # cap velocity for agents
+        vel_agents_norm = t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7
+        speed_violations = vel_agents_norm > self.max_speed
+
+        self.vel_agents = self.vel_agents * t.logical_not(speed_violations).float() + (
+                self.max_speed * self.vel_agents / vel_agents_norm * speed_violations.float())
+
+    def kick_force_tracking(self, actions):
+
+        # our halflife is self.kick_halflife
+        # we want it to decrease like 0.5^(t/halflife) = e^(-ln(2) * t/halflife)
+        # this way we automatically adjust the exponential decrease if we change self.sim_delta_t
+        alpha = np.exp(-np.log(2.0) * self.sim_delta_t / self.kick_halflife)
+
+        self.kick_tracking *= alpha
+
+        # extract the kick action from the overall actions tensor
+        kick_actions = actions[:, :, -1:]  # shape [n_games, 2*n_players, 1]
+        assert kick_actions.shape == t.Size([self.n_games, 2 * self.n_players, 1])
+
+        # on those players where they've waited enough time for the kick, add the kick multiple to tracking
+        self.kick_tracking += (self.k_kick_multiple * self.k_repul_baseline) * kick_actions * (
+                self.kick_tracking < 0.5 ** self.halflives_before_kick)
+
+        assert self.kick_tracking.shape == t.Size([self.n_games, 2 * self.n_players, 1])
+
+    def robot_robot_repulsion(self):
+        # now this is a tensor of size [n_games, 2*n_players, 2*n_players, 2]
+        # which is simply pos_agents copied 2*n_player times along dim=2
+        pos_expanded = self.pos_agents.unsqueeze(2).repeat(1, 1, 2 * self.n_players, 1)
+        assert pos_expanded.shape == t.Size([self.n_games, 2 * self.n_players, 2 * self.n_players, 2])
+
+        # agent_pos_diff[k, i, j] constains a tensor of size 2 with the relative position of
+        # the i-th to the j-th player in the k-th game
+        agent_pos_diff = pos_expanded - pos_expanded.transpose(1, 2)  # size = [n_games, 2*n_players, 2*n_players, 2]
+        assert agent_pos_diff.shape == t.Size([self.n_games, 2 * self.n_players, 2 * self.n_players, 2])
+
+        # tensor containing the distance between the i-th and j-th player
+        # here we add 1e-7 to avoid zero when we compute the distances with themselves
+        # size = [n_games, 2*n_players, 2*n_players, 1]
+        agent_distances = t.norm(agent_pos_diff, dim=3, keepdim=True) + 1e-7
+        assert agent_distances.shape == t.Size([self.n_games, 2 * self.n_players, 2 * self.n_players, 1])
+
+        # Compute repulsive force from position difference
+        # these equations make use of pytorch broadcasting to combine tensors of different shapes
+        agent_force_norms = self.k_repul_baseline / (agent_distances ** 2)
+        net_agent_forces = t.sum((agent_pos_diff * agent_force_norms) / agent_distances, dim=2, keepdim=False)
+        assert agent_force_norms.shape == t.Size([self.n_games, 2 * self.n_players, 2 * self.n_players, 1])
+        assert net_agent_forces.shape == t.Size([self.n_games, 2 * self.n_players, 2])
+
+        # add our net forces to the acceleration tensor
+        self.accel_agents += net_agent_forces
+
+    def robot_ball_repulsion(self):
+        ball_pos_diff = self.pos_ball - self.pos_agents  # size = [n_games, 2*n_players, 2]
+        assert ball_pos_diff.shape == t.Size([self.n_games, 2 * self.n_players, 2])
+
+        # tensor containing the distance between the ball and i-th player
+        ball_distances = t.norm(ball_pos_diff, dim=2, keepdim=True) + 1e-7  # size = [n_games, 2*n_players, 1]
+        assert ball_distances.shape == t.Size([self.n_games, 2 * self.n_players, 1])
+
+        ball_force_norms = self.k_repul_baseline * (1 + self.kick_tracking) / ball_distances ** 2
+        net_ball_forces = t.sum(ball_pos_diff * ball_force_norms / ball_distances, dim=1, keepdim=True)
+
+        assert net_ball_forces.shape == t.Size([self.n_games, 1, 2])
+
+        # add our net forces to the acceleration tensor
+        self.accel_ball += net_ball_forces
+
+    def robot_ball_friction(self):
+        # decrease acceleration in line with the velocity
+        self.accel_agents -= self.friction_coeff_wheels * self.g * \
+                             self.vel_agents / (t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7)
+
+        self.accel_ball -= self.friction_coeff_ball * self.g * \
+                           self.vel_ball / (t.norm(self.vel_ball, dim=1, keepdim=True) + 1e-7)
+
+    def wall_collisions(self):
+        # on the first loop this does agent robot-wall collisions, and on the second ball-wall collisions
+
+        for pos, vel in zip([self.pos_agents, self.pos_ball], [self.vel_agents, self.vel_ball]):
+            x_outbound_left = (pos[:, :, 0:1] < 0)
+            x_outbound_right = (pos[:, :, 0:1] > self.L_x)
+            y_outbound_bottom = (pos[:, :, 1:2] < 0)
+            y_outbound_up = (pos[:, :, 1:2] > self.L_y)
+
+            x_outbounds_bools = x_outbound_left + x_outbound_right
+            y_outbounds_bools = y_outbound_bottom + y_outbound_up
+
+            # shape [n_games, 2*n_players, 2], consists of either 1 or 0, giving the parameters out of bounds
+            outbounds_bools = t.cat([x_outbounds_bools, y_outbounds_bools], dim=2)
+
+            # these are necessary manipulations to prepare our outbound booleans to index the pos_agent arrays
+            zeros_temp = t.zeros(pos.shape[0], pos.shape[1], 1).bool()
+            x_left_indices = t.cat([x_outbound_left, zeros_temp], dim=2)
+            x_right_indices = t.cat([x_outbound_right, zeros_temp], dim=2)
+            y_up_indices = t.cat([zeros_temp, y_outbound_up], dim=2)
+            y_down_indices = t.cat([zeros_temp, y_outbound_bottom], dim=2)
+
+            vel *= (-1) ** outbounds_bools
+
+            pos[x_left_indices] = 0.0
+            pos[x_right_indices] = self.L_x
+            pos[y_down_indices] = 0.0
+            pos[y_up_indices] = self.L_y
+
+    def pos_vel_update(self):
+
+        # increment position from velocity
+        self.pos_agents += self.sim_delta_t * self.vel_agents
+        self.pos_ball += self.sim_delta_t * self.vel_ball
+
+        # increment velocity from acceleration
+        self.vel_agents += self.sim_delta_t * self.accel_agents
+        self.vel_ball += self.sim_delta_t * self.accel_ball
+
+    def ball_goal_distance(self):
+
+        new_ball_goal_dist_team_A = ((self.pos_ball[:, :, 0] ** 2 +
+                                      (self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
+        new_ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x) ** 2 +
+                                      (self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
+        assert new_ball_goal_dist_team_A.shape == t.Size([self.n_games])
+        assert new_ball_goal_dist_team_B.shape == t.Size([self.n_games])
+
+        goal_team_A = 1.0 / new_ball_goal_dist_team_A - 1.0 / self.ball_goal_dist_team_A
+        goal_team_B = 1.0 / new_ball_goal_dist_team_B - 1.0 / self.ball_goal_dist_team_B
+
+        self.ball_goal_dist_team_A = new_ball_goal_dist_team_A
+        self.ball_goal_dist_team_B = new_ball_goal_dist_team_B
+
+        return goal_team_A - goal_team_B
+
+    def time_step(self, actions, verbose=False):
         """
         :param actions:
             we assume that actions is a tensor of size [n_games, 2*n_players, 10]
@@ -106,178 +258,56 @@ class RobocupEnv:
         :return reward_team_A: the rewards for team A, the team B rewards are the negatives of that.
         """
 
+        self.accel_agents *= 0.0
+        self.accel_ball *= 0.0
+
         # ==============================================================================================================
         # Computing acceleration from actions tensor and capping velocity
         # ==============================================================================================================
 
-        if True:
-            self.accel_agents *= 0.0
-            self.accel_ball *= 0.0
-            assert self.accel_agents.shape == t.Size([self.n_games, 2*self.n_players, 2])
-            assert self.accel_ball.shape == t.Size([self.n_games, 1, 2])
-
-            # we assume that the first index corresponds to not accelerating at all and the 1:9 indices correspond to
-            # directions of acceleration
-            no_accel_actions = actions[:, :, 0:1]
-            accel_actions = actions[:, :, 1:9]
-
-            # compute the implied acceleration in x for all agents
-            self.accel_agents[:, :, 0:1] += self.accel * (1.0-no_accel_actions) * (
-                t.cos(2 * np.pi * t.argmax(accel_actions, dim=2, keepdim=True) / 8))
-
-            # compute the implied acceleration in y for all agents
-            self.accel_agents[:, :, 1:2] += self.accel * (1.0 - no_accel_actions) * (
-                t.sin(2 * np.pi * t.argmax(accel_actions, dim=2, keepdim=True) / 8))
-
-            # cap velocity for agents
-            vel_agents_norm = t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7
-            speed_violations = vel_agents_norm > self.max_speed
-
-            self.vel_agents = self.vel_agents * t.logical_not(speed_violations).float() + (
-                    self.max_speed * self.vel_agents/vel_agents_norm * speed_violations.float())
-
+        self.compute_accel_from_actions(actions)
         if verbose: print(f"end of action to accel conversion: {self.pos_agents[0, 0]}")
 
         # ==============================================================================================================
         # Kick force exponential decrease and tracking
         # ==============================================================================================================
 
-        if True:
-            # our halflife is self.kick_halflife
-            # we want it to decrease like 0.5^(t/halflife) = e^(-ln(2) * t/halflife)
-            # this way we automatically adjust the exponential decrease if we change self.sim_delta_t
-            alpha = np.exp(-np.log(2.0) * self.sim_delta_t/self.kick_halflife)
-
-            self.kick_tracking *= alpha
-
-            # extract the kick action from the overall actions tensor
-            kick_actions = actions[:, :, -1:]  # shape [n_games, 2*n_players, 1]
-            assert kick_actions.shape == t.Size([self.n_games, 2*self.n_players, 1])
-
-            # on those players where they've waited enough time for the kick, add the kick multiple to tracking
-            self.kick_tracking += (self.k_kick_multiple * self.k_repul_baseline) * kick_actions * (
-                                  self.kick_tracking < 0.5 ** self.halflives_before_kick)
-
-            assert self.kick_tracking.shape == t.Size([self.n_games, 2*self.n_players, 1])
-
+        self.kick_force_tracking(actions)
         if verbose: print(f"end of kick force exponential decrease: {self.pos_agents[0, 0]}")
+
         # ==============================================================================================================
         # Robot-Robot Repulsion
         # ==============================================================================================================
 
-        if True:
-            # now this is a tensor of size [n_games, 2*n_players, 2*n_players, 2]
-            # which is simply pos_agents copied 2*n_player times along dim=2
-            pos_expanded = self.pos_agents.unsqueeze(2).repeat(1, 1, 2*self.n_players, 1)
-            assert pos_expanded.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 2])
-
-            # agent_pos_diff[k, i, j] constains a tensor of size 2 with the relative position of
-            # the i-th to the j-th player in the k-th game
-            agent_pos_diff = pos_expanded - pos_expanded.transpose(1, 2)   # size = [n_games, 2*n_players, 2*n_players, 2]
-            assert agent_pos_diff.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 2])
-
-            # tensor containing the distance between the i-th and j-th player
-            # here we add 1e-7 to avoid zero when we compute the distances with themselves
-            # size = [n_games, 2*n_players, 2*n_players, 1]
-            agent_distances = t.norm(agent_pos_diff, dim=3, keepdim=True) + 1e-7
-            assert agent_distances.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 1])
-
-            # Compute repulsive force from position difference
-            # these equations make use of pytorch broadcasting to combine tensors of different shapes
-            agent_force_norms = self.k_repul_baseline / (agent_distances ** 2)
-            net_agent_forces = t.sum((agent_pos_diff * agent_force_norms)/agent_distances, dim=2, keepdim=False)
-            assert agent_force_norms.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 1])
-            assert net_agent_forces.shape == t.Size([self.n_games, 2*self.n_players, 2])
-
-            # add our net forces to the acceleration tensor
-            self.accel_agents += net_agent_forces
-
+        self.robot_robot_repulsion()
         if verbose: print(f"end of robot-robot repulsion: {self.pos_agents[0, 0]}")
+
         # ==============================================================================================================
         # Robot-Ball Repulsion
         # ==============================================================================================================
 
-        if True:
-
-            ball_pos_diff = self.pos_ball - self.pos_agents  # size = [n_games, 2*n_players, 2]
-            assert ball_pos_diff.shape == t.Size([self.n_games, 2 * self.n_players, 2])
-
-            # tensor containing the distance between the ball and i-th player
-            ball_distances = t.norm(ball_pos_diff, dim=2, keepdim=True) + 1e-7  # size = [n_games, 2*n_players, 1]
-            assert ball_distances.shape == t.Size([self.n_games, 2 * self.n_players, 1])
-
-            ball_force_norms = self.k_repul_baseline * (1+self.kick_tracking) / ball_distances**2
-            net_ball_forces = t.sum(ball_pos_diff * ball_force_norms/ball_distances, dim=1, keepdim=True)
-
-            assert net_ball_forces.shape == t.Size([self.n_games, 1, 2])
-
-            # add our net forces to the acceleration tensor
-            self.accel_ball += net_ball_forces
-
+        self.robot_ball_repulsion()
         if verbose: print(f"end of robot-ball repulsion: {self.pos_agents[0, 0]}")
+
         # ==============================================================================================================
         # Ball & Robot friction dynamics
         # ==============================================================================================================
 
-        if True:
-            # decrease acceleration in line with the velocity
-            self.accel_agents -= self.friction_coeff_wheels * self.g * \
-                                 self.vel_agents / (t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7)
-
-            self.accel_ball -= self.friction_coeff_ball * self.g * \
-                               self.vel_ball/(t.norm(self.vel_ball, dim=1, keepdim=True) + 1e-7)
-
+        self.robot_ball_friction()
         if verbose: print(f"end of friction compute: {self.pos_agents[0, 0]}")
+
         # ==============================================================================================================
         # Robot-Wall and Ball-Wall Collisions
         # ==============================================================================================================
 
-        if True:
-
-            # on the first loop this does agent robot-wall collisions, and on the second ball-wall collisions
-
-            for pos, vel in zip([self.pos_agents, self.pos_ball], [self.vel_agents, self.vel_ball]):
-
-                x_outbound_left = (pos[:, :, 0:1] < 0)
-                x_outbound_right = (pos[:, :, 0:1] > self.L_x)
-                y_outbound_bottom = (pos[:, :, 1:2] < 0)
-                y_outbound_up = (pos[:, :, 1:2] > self.L_y)
-
-                x_outbounds_bools = x_outbound_left + x_outbound_right
-                y_outbounds_bools = y_outbound_bottom + y_outbound_up
-
-                # shape [n_games, 2*n_players, 2], consists of either 1 or 0, giving the parameters out of bounds
-                outbounds_bools = t.cat([x_outbounds_bools, y_outbounds_bools], dim=2)
-
-                # these are necessary manipulations to prepare our outbound booleans to index the pos_agent arrays
-                zeros_temp = t.zeros(pos.shape[0], pos.shape[1], 1).bool()
-                x_left_indices = t.cat([x_outbound_left, zeros_temp], dim=2)
-                x_right_indices = t.cat([x_outbound_right, zeros_temp], dim=2)
-                y_up_indices = t.cat([zeros_temp, y_outbound_up], dim=2)
-                y_down_indices = t.cat([zeros_temp, y_outbound_bottom], dim=2)
-
-                vel *= (-1)**outbounds_bools
-
-                pos[x_left_indices] = 0.0
-                pos[x_right_indices] = self.L_x
-                pos[y_down_indices] = 0.0
-                pos[y_up_indices] = self.L_y
-
+        self.wall_collisions()
         if verbose: print(f"end of wall collisions: {self.pos_agents[0, 0]}")
 
         # ==============================================================================================================
         # Position and Velocity Updates
         # ==============================================================================================================
 
-        if True:
-            # increment position from velocity
-            self.pos_agents += self.sim_delta_t * self.vel_agents
-            self.pos_ball += self.sim_delta_t * self.vel_ball
-
-            # increment velocity from acceleration
-            self.vel_agents += self.sim_delta_t * self.accel_agents
-            self.vel_ball += self.sim_delta_t * self.accel_ball
-
+        self.pos_vel_update()
         if verbose: print(f"end of acceleration compute: {self.pos_agents[0, 0]}")
 
         # ==============================================================================================================
@@ -285,23 +315,7 @@ class RobocupEnv:
         # ==============================================================================================================
         # we assume the goals are at coordinates (0, L_y/2) and (L_x , L_y/2)
 
-        new_ball_goal_dist_team_A = ((self.pos_ball[:, :, 0]**2 +
-                                      (self.pos_ball[:, :, 1] - self.L_y/2)**2)**0.5).squeeze()
-        new_ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x)**2 +
-                                      (self.pos_ball[:, :, 1] - self.L_y/2)**2)**0.5).squeeze()
-        assert new_ball_goal_dist_team_A.shape == t.Size([self.n_games])
-        assert new_ball_goal_dist_team_B.shape == t.Size([self.n_games])
-
-        goal_team_A = 1.0/new_ball_goal_dist_team_A - 1.0/self.ball_goal_dist_team_A
-        goal_team_B = 1.0/new_ball_goal_dist_team_B - 1.0/self.ball_goal_dist_team_B
-
-        if new_action_bool:
-            self.ball_goal_dist_team_A = new_ball_goal_dist_team_A
-            self.ball_goal_dist_team_B = new_ball_goal_dist_team_B
-
-        return goal_team_A - goal_team_B
-
-
+        return self.ball_goal_distance()
 
 
 if __name__ == "__main___":
