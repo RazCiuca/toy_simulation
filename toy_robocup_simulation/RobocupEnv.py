@@ -85,6 +85,10 @@ class RobocupEnv:
         self.ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x) ** 2 + (
                     self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
 
+        # storing states
+        self.prev_state_team_A = None
+        self.prev_state_team_B = None
+
     def get_state(self):
         """
         :return: should return the state suitable for passing to our model for action prediction
@@ -102,7 +106,65 @@ class RobocupEnv:
         be invariant
 
         """
-        pass
+        # these are here as convenient reminders of the sizes of useful tensors
+        assert self.pos_ball.shape == t.Size([self.n_games, 1, 2])
+        assert self.vel_ball.shape == t.Size([self.n_games, 1, 2])
+        assert self.pos_agents.shape == t.Size([self.n_games, 2*self.team_size, 2])
+        assert self.vel_agents.shape == t.Size([self.n_games, 2*self.team_size, 2])
+
+        # extract the positions and velocities of each team
+        pos_agents_A = self.pos_agents[:, :self.team_size]
+        pos_agents_B = self.pos_agents[:, self.team_size:]
+        vel_agents_A = self.vel_agents[:, :self.team_size]
+        vel_agents_B = self.vel_agents[:, self.team_size:]
+
+        # combine the velocity and position in a single tensor
+        pos_vel_A = t.cat([pos_agents_A, vel_agents_A], dim=2)
+        pos_vel_B = t.cat([pos_agents_B, vel_agents_B], dim=2)
+
+        assert pos_vel_A.shape == t.Size([self.n_games, self.team_size, 4])
+        assert pos_vel_B.shape == t.Size([self.n_games, self.team_size, 4])
+
+        # for every player in the team we need a whole copy of the positions and velocities of everyone
+        # this is massaging the tensors so that state_pos_team_A[i,j] has size [self.team_size, 2]
+        # and hence contains the position of the whole team, whatever the j is.
+        state_pos_team_A = pos_agents_A.reshape(self.n_games, -1).unsqueeze(1).repeat(1, self.team_size, 1)
+        state_vel_team_A = vel_agents_A.reshape(self.n_games, -1).unsqueeze(1).repeat(1, self.team_size, 1)
+        state_pos_team_B = pos_agents_B.reshape(self.n_games, -1).unsqueeze(1).repeat(1, self.team_size, 1)
+        state_vel_team_B = vel_agents_B.reshape(self.n_games, -1).unsqueeze(1).repeat(1, self.team_size, 1)
+
+        assert state_pos_team_A.shape == t.Size([self.n_games, self.team_size, 2*self.team_size])
+        assert state_vel_team_A.shape == t.Size([self.n_games, self.team_size, 2*self.team_size])
+
+        # repeat the state of the ball for all agents
+        pos_vel_ball = t.cat([self.pos_ball, self.vel_ball], dim=2)
+        state_ball = pos_vel_ball.repeat(1, self.team_size, 1)
+
+        assert state_ball.shape == t.Size([self.n_games, self.team_size, 4])
+
+        # now we finally combine everything into a state for each team
+        # we have two different states because the two teams need to be treated differently, an agent in team A
+        # needs to be told (via the position of arguments) which team is his
+        state_team_A = t.cat([pos_vel_A, state_ball, state_pos_team_A, state_vel_team_A, state_pos_team_B, state_vel_team_B], dim=2)
+        state_team_B = t.cat([pos_vel_B, state_ball, state_pos_team_B, state_vel_team_B, state_pos_team_A, state_vel_team_A], dim=2)
+
+        assert state_team_A.shape == t.Size([self.n_games, self.team_size, 2*(2*(2+2*self.team_size))])
+
+        if self.prev_state_team_A is None:
+            full_state_team_A = t.cat([state_team_A, state_team_A], dim=2)
+        else:
+            full_state_team_A = t.cat([state_team_A, self.prev_state_team_A], dim=2)
+        if self.prev_state_team_B is None:
+            full_state_team_B = t.cat([state_team_B, state_team_B], dim=2)
+        else:
+            full_state_team_B = t.cat([state_team_B, self.prev_state_team_B], dim=2)
+
+        assert full_state_team_A.shape == t.Size([self.n_games, self.team_size, 16 * (1+self.team_size)])
+
+        self.prev_state_team_A = state_team_A.clone()
+        self.prev_state_team_B = state_team_B.clone()
+
+        return full_state_team_A, full_state_team_B
 
     def get_episode_history(self):
         pass
@@ -259,7 +321,10 @@ class RobocupEnv:
         self.ball_goal_dist_team_A = new_ball_goal_dist_team_A
         self.ball_goal_dist_team_B = new_ball_goal_dist_team_B
 
-        return goal_team_A - goal_team_B
+        reward_team_A = goal_team_A - goal_team_B
+        reward_team_B = -reward_team_A
+
+        return reward_team_A, reward_team_B
 
     def time_step(self, actions, verbose=False):
         """
@@ -400,7 +465,7 @@ if __name__ == "__main__":
     x_team_B = []
     y_team_B = []
 
-    for i in range(0, 400):
+    for i in range(0, 5):
         if i % 1 == 0:
             time.append(i*env.control_delta_t)
 
@@ -410,6 +475,8 @@ if __name__ == "__main__":
             y_team_A.append(env.pos_agents[0, 0:team_size, 1].numpy().copy())
             x_team_B.append(env.pos_agents[0, team_size:, 0].numpy().copy())
             y_team_B.append(env.pos_agents[0, team_size:, 1].numpy().copy())
+
+            state_A, state_B = env.get_state()
 
         reward, new_state = env.time_step(actions, verbose=False)
 

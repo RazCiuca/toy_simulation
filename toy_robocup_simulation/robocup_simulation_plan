@@ -121,6 +121,11 @@ Hence:
 
 reward_t = ( 1/Distance(goal, ball_pos_t) - 1/Distance(goal, ball_pos_(t-1)) )
 
+But notice that this reward is not symmetric with respect to both teams. A better reward should
+reward advances near opponent's goal and penalize the opponent's advances. Mirroring the field
+along the x axis should produce the opponent's reward
+
+
 The episode ends if Distance(goal, ball_pos) either is smaller than some constant
 
 --------------------
