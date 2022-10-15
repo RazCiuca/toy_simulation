@@ -4,13 +4,6 @@ date: oct 10 2022
 
 file containing the RobocupEnv class, which contains all the logic that defines our game
 
-todo:
-- debugging everything by testing
-    write lots of asserts checking for tensor shapes
-- writing more comments to explain what's going on
-- ball-wall collisions
-- ball-goal reward computations
-
 """
 
 import numpy as np
@@ -98,6 +91,19 @@ class RobocupEnv:
                     (self.pos_ball[:, :, 0] ** 2 + (self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
         self.ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x) ** 2 + (
                     self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
+
+    def get_state(self):
+        """
+        :return: should return the state suitable for passing to our model for action prediction
+        """
+        pass
+
+    def get_episode_history(self):
+        pass
+
+    def save_episode_to_file(self):
+        pass
+
     def time_step(self, actions, new_action_bool=False):
         """
         :param actions:
@@ -106,7 +112,7 @@ class RobocupEnv:
             number is assumed to either be 1 or 0, corresponding to the kick decision
         :param new_action_bool: boolean that states if we are doing a simulation step in which new actions
             are given by the model, or not
-        :return reward_team_A, reward_team_B: the rewards both teams have accumulated since the last action was taken
+        :return reward_team_A: the rewards for team A, the team B rewards are the negatives of that.
         """
 
         # ==============================================================================================================
@@ -187,19 +193,13 @@ class RobocupEnv:
             # agent_pos_diff[k, i, j] constains a tensor of size 2 with the relative position of
             # the i-th to the j-th player in the k-th game
             agent_pos_diff = pos_expanded - pos_expanded.transpose(1, 2)   # size = [n_games, 2*n_players, 2*n_players, 2]
-            ball_pos_diff = self.pos_ball - self.pos_agents                 # size = [n_games, 2*n_players, 2]
             assert agent_pos_diff.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 2])
-            assert ball_pos_diff.shape == t.Size([self.n_games, 2*self.n_players, 2])
 
             # tensor containing the distance between the i-th and j-th player
             # here we add 1e-7 to avoid zero when we compute the distances with themselves
             # size = [n_games, 2*n_players, 2*n_players, 1]
             agent_distances = t.norm(agent_pos_diff, dim=3, keepdim=True) + 1e-7
             assert agent_distances.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 1])
-
-            # tensor containing the distance between the ball and i-th player
-            ball_distances = t.norm(ball_pos_diff, dim=3, keepdim=True) + 1e-7      # size = [n_games, 2*n_players, 1]
-            assert ball_distances.shape == t.Size([self.n_games, 2*self.n_players, 1])
 
             # Compute repulsive force from position difference
             # these equations make use of pytorch broadcasting to combine tensors of different shapes
@@ -216,6 +216,14 @@ class RobocupEnv:
         # ==============================================================================================================
 
         if True:
+
+            ball_pos_diff = self.pos_ball - self.pos_agents  # size = [n_games, 2*n_players, 2]
+            assert ball_pos_diff.shape == t.Size([self.n_games, 2 * self.n_players, 2])
+
+            # tensor containing the distance between the ball and i-th player
+            ball_distances = t.norm(ball_pos_diff, dim=3, keepdim=True) + 1e-7  # size = [n_games, 2*n_players, 1]
+            assert ball_distances.shape == t.Size([self.n_games, 2 * self.n_players, 1])
+
             ball_force_norms = self.k_repul_baseline * (1+self.kick_tracking) / ball_distances**2
             net_ball_forces = t.sum(ball_pos_diff * ball_force_norms/ball_distances, dim=1, keepdim=True)
 
@@ -274,7 +282,7 @@ class RobocupEnv:
         # Ball-Goal Distance
         # ==============================================================================================================
         # we assume the goals are at coordinates (0, L_y/2) and (L_x , L_y/2)
-        # IMPORTANT: notice that the two teams are not optimizing the same goal
+
         new_ball_goal_dist_team_A = ((self.pos_ball[:, :, 0]**2 +
                                       (self.pos_ball[:, :, 1] - self.L_y/2)**2)**0.5).squeeze()
         new_ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x)**2 +
@@ -282,14 +290,12 @@ class RobocupEnv:
         assert new_ball_goal_dist_team_A.shape == t.Size([self.n_games])
         assert new_ball_goal_dist_team_B.shape == t.Size([self.n_games])
 
-        reward_team_A = 1.0/new_ball_goal_dist_team_A - 1.0/self.ball_goal_dist_team_A
-        reward_team_B = 1.0/new_ball_goal_dist_team_A - 1.0/self.ball_goal_dist_team_A
+        goal_team_A = 1.0/new_ball_goal_dist_team_A - 1.0/self.ball_goal_dist_team_A
+        goal_team_B = 1.0/new_ball_goal_dist_team_B - 1.0/self.ball_goal_dist_team_B
 
         if new_action_bool:
             self.ball_goal_dist_team_A = new_ball_goal_dist_team_A
             self.ball_goal_dist_team_B = new_ball_goal_dist_team_B
 
-        return reward_team_A, reward_team_B
+        return goal_team_A - goal_team_B
 
-    def get_episode_history(self):
-        pass
