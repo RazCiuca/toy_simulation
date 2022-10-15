@@ -16,20 +16,7 @@ class RobocupEnv:
     For simplicity we will discretise the possible action space of our robot. At each time step it will have the
     following actions:
     - 9 possible choices of acceleration: either 0, or a constant in one of 8 directions
-    - 3 choices of rotational acceleration: either 0, counterclockwise or clockwise
     - 1 shooting action, with a cooldown
-
-    For the simulation, here are the things we take into account:
-
-    Fundamental problem is needing to not use python for loops, given that they're much too slow.
-    So we need to accomplish all these tasks with pytorch array manipulations as much as possible.
-
-    Another problem is the time-slice size. The times at which we can the agent to make decisions and the
-    timeslice we use in the simulation are different.
-
-    Another possibility is just to check for robots intersecting and then to simply set their positions
-    along the line joining their centers, with their speeds reversed along this direction.
-
     """
     def __init__(self, n_games, n_players):
 
