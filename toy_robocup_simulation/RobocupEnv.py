@@ -6,8 +6,10 @@ file containing the RobocupEnv class, which contains all the logic that defines 
 
 """
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch as t
+import torch.nn.functional as F
 
 class RobocupEnv:
     """
@@ -72,7 +74,7 @@ class RobocupEnv:
                                 self.L_y * t.rand(n_games, 2*n_players, 1)], dim=2)
         self.pos_ball = t.cat([self.L_x * t.rand(n_games, 1, 1), self.L_y * t.rand(n_games, 1, 1)], dim=2)
 
-        # keeping track of current "kick multiple", after a kick action, this becomes 1.0, then
+        # keeping track of current "kick multiple", after a kick action, this becomes self.k_kick_multiple, then
         # exponentially decreases with time
         self.kick_tracking = t.zeros(n_games, 2*n_players, 1)
 
@@ -104,7 +106,7 @@ class RobocupEnv:
     def save_episode_to_file(self):
         pass
 
-    def time_step(self, actions, new_action_bool=False):
+    def time_step(self, actions, new_action_bool=False, verbose=False):
         """
         :param actions:
             we assume that actions is a tensor of size [n_games, 2*n_players, 10]
@@ -139,12 +141,13 @@ class RobocupEnv:
                 t.sin(2 * np.pi * t.argmax(accel_actions, dim=2, keepdim=True) / 8))
 
             # cap velocity for agents
-            vel_agents_norm = t.norm(self.vel_agents, dim=2, keepdim=True)
+            vel_agents_norm = t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7
             speed_violations = vel_agents_norm > self.max_speed
 
-            self.vel_agents = self.vel_agents * (1.0 - speed_violations) + (
-                    self.max_speed * self.vel_agents/vel_agents_norm * speed_violations)
+            self.vel_agents = self.vel_agents * t.logical_not(speed_violations).float() + (
+                    self.max_speed * self.vel_agents/vel_agents_norm * speed_violations.float())
 
+        if verbose: print(f"end of action to accel conversion: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Position and Velocity calculations
         # ==============================================================================================================
@@ -158,6 +161,7 @@ class RobocupEnv:
             self.vel_agents += self.sim_delta_t * self.accel_agents
             self.vel_ball += self.sim_delta_t * self.accel_ball
 
+        if verbose: print(f"end of acceleration compute: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Kick force exponential decrease and tracking
         # ==============================================================================================================
@@ -166,20 +170,21 @@ class RobocupEnv:
             # our halflife is self.kick_halflife
             # we want it to decrease like 0.5^(t/halflife) = e^(-ln(2) * t/halflife)
             # this way we automatically adjust the exponential decrease if we change self.sim_delta_t
-            alpha = t.exp(-np.log(2.0) * self.sim_delta_t/self.kick_halflife)
+            alpha = np.exp(-np.log(2.0) * self.sim_delta_t/self.kick_halflife)
 
             self.kick_tracking *= alpha
 
             # extract the kick action from the overall actions tensor
-            kick_actions = actions[:, :, -1:].squeeze()  # shape [n_games, 2*n_players, 1]
+            kick_actions = actions[:, :, -1:]  # shape [n_games, 2*n_players, 1]
             assert kick_actions.shape == t.Size([self.n_games, 2*self.n_players, 1])
 
             # on those players where they've waited enough time for the kick, add the kick multiple to tracking
-            self.kick_tracking += self.k_kick_multiple * (self.kick_tracking < 0.5 ** self.halflives_before_kick) *\
-                                  kick_actions
+            self.kick_tracking += (self.k_kick_multiple * self.k_repul_baseline) * kick_actions * (
+                                  self.kick_tracking < 0.5 ** self.halflives_before_kick)
 
             assert self.kick_tracking.shape == t.Size([self.n_games, 2*self.n_players, 1])
 
+        if verbose: print(f"end of kick force exponential decrease: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Robot-Robot Repulsion
         # ==============================================================================================================
@@ -187,7 +192,7 @@ class RobocupEnv:
         if True:
             # now this is a tensor of size [n_games, 2*n_players, 2*n_players, 2]
             # which is simply pos_agents copied 2*n_player times along dim=2
-            pos_expanded = self.pos_agents.unsqueeze(2).repeat(1, 1, 2*self.n_players, 2)
+            pos_expanded = self.pos_agents.unsqueeze(2).repeat(1, 1, 2*self.n_players, 1)
             assert pos_expanded.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 2])
 
             # agent_pos_diff[k, i, j] constains a tensor of size 2 with the relative position of
@@ -204,13 +209,14 @@ class RobocupEnv:
             # Compute repulsive force from position difference
             # these equations make use of pytorch broadcasting to combine tensors of different shapes
             agent_force_norms = self.k_repul_baseline / (agent_distances ** 2)
-            net_agent_forces = t.sum((agent_pos_diff * agent_force_norms)/agent_distances, dim=2)
-            assert agent_force_norms.shape == t.Size([self.n_games, 2*self.n_players, 1])
+            net_agent_forces = t.sum((agent_pos_diff * agent_force_norms)/agent_distances, dim=2, keepdim=False)
+            assert agent_force_norms.shape == t.Size([self.n_games, 2*self.n_players, 2*self.n_players, 1])
             assert net_agent_forces.shape == t.Size([self.n_games, 2*self.n_players, 2])
 
             # add our net forces to the acceleration tensor
             self.accel_agents += net_agent_forces
 
+        if verbose: print(f"end of robot-robot repulsion: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Robot-Ball Repulsion
         # ==============================================================================================================
@@ -221,7 +227,7 @@ class RobocupEnv:
             assert ball_pos_diff.shape == t.Size([self.n_games, 2 * self.n_players, 2])
 
             # tensor containing the distance between the ball and i-th player
-            ball_distances = t.norm(ball_pos_diff, dim=3, keepdim=True) + 1e-7  # size = [n_games, 2*n_players, 1]
+            ball_distances = t.norm(ball_pos_diff, dim=2, keepdim=True) + 1e-7  # size = [n_games, 2*n_players, 1]
             assert ball_distances.shape == t.Size([self.n_games, 2 * self.n_players, 1])
 
             ball_force_norms = self.k_repul_baseline * (1+self.kick_tracking) / ball_distances**2
@@ -232,6 +238,7 @@ class RobocupEnv:
             # add our net forces to the acceleration tensor
             self.accel_ball += net_ball_forces
 
+        if verbose: print(f"end of robot-ball repulsion: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Ball & Robot friction dynamics
         # ==============================================================================================================
@@ -239,11 +246,12 @@ class RobocupEnv:
         if True:
             # decrease acceleration in line with the velocity
             self.accel_agents -= self.friction_coeff_wheels * self.g * \
-                                 self.vel_agents / t.norm(self.vel_agents, dim=2, keepdim=True)
+                                 self.vel_agents / (t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7)
 
             self.accel_ball -= self.friction_coeff_ball * self.g * \
-                               self.vel_ball/t.norm(self.vel_ball, dim=1, keepdim=True)
+                               self.vel_ball/(t.norm(self.vel_ball, dim=1, keepdim=True) + 1e-7)
 
+        if verbose: print(f"end of friction compute: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Robot-Wall and Ball-Wall Collisions
         # ==============================================================================================================
@@ -251,6 +259,7 @@ class RobocupEnv:
         if True:
 
             # on the first loop this does agent robot-wall collisions, and on the second ball-wall collisions
+
             for pos, vel in zip([self.pos_agents, self.pos_ball], [self.vel_agents, self.vel_ball]):
 
                 x_outbound_left = (pos[:, :, 0:1] < 0)
@@ -265,7 +274,7 @@ class RobocupEnv:
                 outbounds_bools = t.cat([x_outbounds_bools, y_outbounds_bools], dim=2)
 
                 # these are necessary manipulations to prepare our outbound booleans to index the pos_agent arrays
-                zeros_temp = t.zeros(self.n_games, 2*self.n_players, 1, dtype=t.long)
+                zeros_temp = t.zeros(pos.shape[0], pos.shape[1], 1).bool()
                 x_left_indices = t.cat([x_outbound_left, zeros_temp], dim=2)
                 x_right_indices = t.cat([x_outbound_right, zeros_temp], dim=2)
                 y_up_indices = t.cat([zeros_temp, y_outbound_up], dim=2)
@@ -278,6 +287,7 @@ class RobocupEnv:
                 pos[y_down_indices] = 0.0
                 pos[y_up_indices] = self.L_y
 
+        if verbose: print(f"end of wall collisions: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Ball-Goal Distance
         # ==============================================================================================================
@@ -299,3 +309,37 @@ class RobocupEnv:
 
         return goal_team_A - goal_team_B
 
+if __name__ == "__main__":
+
+    t.manual_seed(1334315)
+
+    n_games = 10
+    n_players = 6
+
+    env = RobocupEnv(n_games, n_players)
+
+    actions = t.cat( [F.one_hot( t.floor(9*t.rand(n_games, 2*n_players)).long()),
+                      t.floor(2*t.rand(n_games, 2*n_players, 1)).long()], dim=2)
+
+    assert actions.shape == t.Size([n_games, 2*n_players, 10])
+
+    time = []
+    x = []
+    y = []
+
+    for i in range(0, 1000):
+        print(env.pos_agents[0, 0])
+        if i%10 == 0:
+            time.append(i)
+            x.append(env.pos_agents[0, 0, 0].item())
+            y.append(env.pos_agents[0, 0, 1].item())
+        env.time_step(actions, verbose=False)
+
+    # Bouncing Parabolas!! it (probably) works
+    plt.subplot(211)
+    plt.title("x position over time")
+    plt.plot(np.array(time), np.array(x))
+    plt.subplot(212)
+    plt.title("y position over time")
+    plt.plot(np.array(time), np.array(y))
+    plt.show()
