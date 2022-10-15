@@ -7,6 +7,8 @@ file containing the RobocupEnv class, which contains all the logic that defines 
 """
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
 import numpy as np
 import torch as t
 import torch.nn.functional as F
@@ -32,8 +34,8 @@ class RobocupEnv:
         # robot constants
         self.robot_radius = 0.178      # radius of robot in meters, NOT USED RIGHT NOW
         self.robot_mass = 2.62         # robot mass in kg, NOT USED RIGHT NOW
-        self.accel = 1.0               # linear acceleration of robot, in m/s^2
-        self.max_speed = 2.0           # max speed of robot, in m/s
+        self.accel = 6.0               # linear acceleration of robot, in m/s^2
+        self.max_speed = 4.0           # max speed of robot, in m/s
 
         # shooting constants
         self.k_repul_baseline = 0.1    # baseline repulsive constant
@@ -43,7 +45,7 @@ class RobocupEnv:
 
         # physical constants
         self.g = 9.81                  # gravitational acceleration, in m/s^2
-        self.friction_coeff_wheels = 0.7  # friction coefficient between wheels and terrain, needs to be tested
+        self.friction_coeff_wheels = 0.1  # friction coefficient between wheels and terrain, needs to be tested
         self.friction_coeff_ball = 2e-3  # friction coefficient between rolling ball and terrain
 
         # simulation constants
@@ -135,20 +137,7 @@ class RobocupEnv:
                     self.max_speed * self.vel_agents/vel_agents_norm * speed_violations.float())
 
         if verbose: print(f"end of action to accel conversion: {self.pos_agents[0, 0]}")
-        # ==============================================================================================================
-        # Position and Velocity calculations
-        # ==============================================================================================================
 
-        if True:
-            # increment position from velocity
-            self.pos_agents += self.sim_delta_t * self.vel_agents
-            self.pos_ball += self.sim_delta_t * self.vel_ball
-
-            # increment velocity from acceleration
-            self.vel_agents += self.sim_delta_t * self.accel_agents
-            self.vel_ball += self.sim_delta_t * self.accel_ball
-
-        if verbose: print(f"end of acceleration compute: {self.pos_agents[0, 0]}")
         # ==============================================================================================================
         # Kick force exponential decrease and tracking
         # ==============================================================================================================
@@ -275,6 +264,22 @@ class RobocupEnv:
                 pos[y_up_indices] = self.L_y
 
         if verbose: print(f"end of wall collisions: {self.pos_agents[0, 0]}")
+
+        # ==============================================================================================================
+        # Position and Velocity Updates
+        # ==============================================================================================================
+
+        if True:
+            # increment position from velocity
+            self.pos_agents += self.sim_delta_t * self.vel_agents
+            self.pos_ball += self.sim_delta_t * self.vel_ball
+
+            # increment velocity from acceleration
+            self.vel_agents += self.sim_delta_t * self.accel_agents
+            self.vel_ball += self.sim_delta_t * self.accel_ball
+
+        if verbose: print(f"end of acceleration compute: {self.pos_agents[0, 0]}")
+
         # ==============================================================================================================
         # Ball-Goal Distance
         # ==============================================================================================================
@@ -296,7 +301,14 @@ class RobocupEnv:
 
         return goal_team_A - goal_team_B
 
-if __name__ == "__main__":
+
+
+
+if __name__ == "__main___":
+
+    # ==============================================================================================================
+    # Plotting Coordinates of a single Agent
+    # ==============================================================================================================
 
     t.manual_seed(1334315)
 
@@ -329,4 +341,61 @@ if __name__ == "__main__":
     plt.subplot(212)
     plt.title("y position over time")
     plt.plot(np.array(time), np.array(y))
+    plt.show()
+
+
+if __name__ == "__main__":
+
+    # ==============================================================================================================
+    # Making Animation of the episode
+    # ==============================================================================================================
+    # use the matplotlib animation api:
+    # https://matplotlib.org/stable/api/animation_api.html
+
+    t.manual_seed(1334315)
+
+    n_games = 10
+    n_players = 6
+
+    env = RobocupEnv(n_games, n_players)
+
+    actions = t.cat([F.one_hot(t.floor(9 * t.rand(n_games, 2 * n_players)).long()),
+                     t.floor(2 * t.rand(n_games, 2 * n_players, 1)).long()], dim=2)
+
+    assert actions.shape == t.Size([n_games, 2 * n_players, 10])
+
+    time = []
+    x_team_A = []
+    y_team_A = []
+    x_team_B = []
+    y_team_B = []
+
+    for i in range(0, 4000):
+        if i % 10 == 0:
+            time.append(i*env.sim_delta_t)
+
+            print(f"time: {time[-1]} + sample agent pos: {env.pos_agents[0, 0]}")
+
+            x_team_A.append(env.pos_agents[0, 0:n_players, 0].numpy().copy())
+            y_team_A.append(env.pos_agents[0, 0:n_players, 1].numpy().copy())
+            x_team_B.append(env.pos_agents[0, n_players:, 0].numpy().copy())
+            y_team_B.append(env.pos_agents[0, n_players:, 1].numpy().copy())
+
+        env.time_step(actions, verbose=False)
+
+    # todo: actually write simulation in matplotlib
+
+    # for i in range(0, len(x_team_A)):
+    #     plt.scatter(x_team_A[i], y_team_A[i], color="r", alpha=0.1)
+    #     plt.scatter(x_team_B[i], y_team_B[i], color="b", alpha=0.1)
+
+    x_team_A = np.array(x_team_A)
+    y_team_A = np.array(y_team_A)
+    x_team_B = np.array(x_team_B)
+    y_team_B = np.array(y_team_B)
+
+    for i in range(0, n_players):
+        plt.plot(x_team_A[:, i], y_team_A[:, i], color="r")
+        plt.plot(x_team_B[:, i], y_team_B[:, i], color="b")
+
     plt.show()
