@@ -1,47 +1,18 @@
 
--------------------------------------------
-Simulation VERSION 1.0
--------------------------------------------
-- Essentially electrons controlled by optional accelerations
-- The ball is an electron with a smaller radius
-- No rotational control at all.
-- add ball and robot friction
-- add temporary "kick" corresponding to an additional repulsion of the ball for a few seconds
-    - restrain
 
+- (done) write state-producing and reward producing function for the RobocupEnv class
+- write training loop with a neural network that produces actions
+    - write code to sample from distribution implied by Q-values
+    - test code to make sure it's doing something reasonable
+    - set last layer biases to be higher in order to start optimistically, to explore more in beginning.
+- visualization of reward over time
+- implement device setting in the environment so we can simulate on GPU
 
+- implementing QLearner
+- writing more comments to explain what's going on
+- write libraries to save game states
 
--------------------------------------------
-Decision: code in C instead?
-
--------------------------------------------
-
-We have our terrain of size L_x by L_y
-n players on each team, playing K games simultaneously
-how many variables? 2*(2n + 1) : 2n players plus the ball in 2 dimensions.
-we need to compute the distances between all pairs of players.
-what functionalities do we want eventually?
-    all players repel if they get too close
-    friction from ground
-
-- For the moment
-
-let X = [K, 2n+1, 2] be a tensor containing the location of all players for all games, we need a tensor containing the difference
-between all elements of X for all games
-
-X_p = X.unsqueeze(2).repeat(1, 1, 2n+1, 1)
-
-X_dist = X_p - X_p.tranpose(1,2)
-
-X_norms = X_dist.norm(dim=-1)
-X_directions = X_dist/X_norms
-
-The force potential could be something like c/(x-r) so that the balls repel at radius
-
-dV(r)/dr =
-
-d^2 x/dt^2 = F/m = SUM( -(1/m) dV(r)/dr * X_dist)
-
-
-Forces =
+- after implementing a TD(0) Q-Learner, write the general TD(n) case
+- implement importance sampling to learn off-policy from old games
+-
 

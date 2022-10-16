@@ -8,7 +8,18 @@ for Q(s,a). We use epsilon-random exploration, a replay buffer that we treat usi
 See Chapters 4 to 5 of Sutton & Barto: Reinforcement Learning
 """
 
-class QLearner:
+import torch as t
+from NNmodels import *
 
-    def __init__(self, epsilon):
+class QLearner:
+    """
+    NOT USED RIGHT NOW, MAIN Q-LEARNING LOGIC IS IN train.py
+    """
+    def __init__(self, explore_eps, ):
+        pass
+
+    def train(self, ):
+        pass
+
+    def sample(self):
         pass

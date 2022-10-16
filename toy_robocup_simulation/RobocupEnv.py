@@ -24,6 +24,7 @@ class RobocupEnv:
 
         self.n_games = n_games         # number of simultaneous games played
         self.team_size = team_size     # number of players in each team
+        self.state_size = 16 * (1+self.team_size)  # the dimension of our state
 
         # game constants
         self.L_x = 10.4                # Length of field in meters
@@ -99,11 +100,10 @@ class RobocupEnv:
         It should include
         1. the position and velocity of the ball at t_n and t_(n-1)
         2. the position and velocity of the controlled agent at t_n and t_(n-1)
-        3. the position and velocity of teammates at t_n and t_(n-1)
+        3. the position and velocity of teammates (including itself) at t_n and t_(n-1)
         4. the position and velocity of opponents at t_n and t_(n-1)
 
-        the relative positions of these 4 components in the array should be consistent. Our learned model will
-        be invariant
+        our total state size is 16*(1+self.team_size)
 
         """
         # these are here as convenient reminders of the sizes of useful tensors
@@ -306,7 +306,7 @@ class RobocupEnv:
         self.vel_agents += self.sim_delta_t * self.accel_agents
         self.vel_ball += self.sim_delta_t * self.accel_ball
 
-    def ball_goal_distance(self):
+    def get_reward(self):
 
         new_ball_goal_dist_team_A = ((self.pos_ball[:, :, 0] ** 2 +
                                       (self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
@@ -398,7 +398,7 @@ class RobocupEnv:
         # ==============================================================================================================
         # we assume the goals are at coordinates (0, L_y/2) and (L_x , L_y/2)
 
-        return self.ball_goal_distance(), self.get_state()
+        return self.get_reward()
 
 
 if __name__ == "__main___":
@@ -465,7 +465,13 @@ if __name__ == "__main__":
     x_team_B = []
     y_team_B = []
 
-    for i in range(0, 5):
+    for i in range(0, 100):
+
+        # fun with changing the action directly every few iterations
+        if i % 20 == 0:
+            actions = t.cat([F.one_hot(t.floor(9 * t.rand(n_games, 2 * team_size)).long()),
+                             t.floor(2 * t.rand(n_games, 2 * team_size, 1)).long()], dim=2)
+
         if i % 1 == 0:
             time.append(i*env.control_delta_t)
 
@@ -489,4 +495,5 @@ if __name__ == "__main__":
         plt.plot(x_team_A[:, i], y_team_A[:, i], color="r")
         plt.plot(x_team_B[:, i], y_team_B[:, i], color="b")
 
+    plt.margins(0.0)
     plt.show()

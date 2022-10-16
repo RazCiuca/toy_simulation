@@ -36,7 +36,7 @@ class MLP(nn.Module):
     def forward(self, inputs):
         """
         :param inputs: assumed to be of size [batch_size, self.nodes[0]]
-        :return: returns the output tensor, of size [batch_size, self,nodes[-1]]
+        :return: returns the output tensor, of size [batch_size, self.nodes[-1]]
         """
 
         x = inputs
