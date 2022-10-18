@@ -7,7 +7,6 @@ file containing the RobocupEnv class, which contains all the logic that defines 
 """
 
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 
 import numpy as np
 import torch as t
@@ -15,6 +14,15 @@ import torch.nn.functional as F
 
 class RobocupEnv:
     """
+    This class contains the entire logic of our Toy version of Robocup Small-Size League game.
+    The critical functions that we need to implement are RobocupEnv.get_state, RobocupEnv.get_reward, and
+    RobocupEnv.time_step. The output of get_state is a vector that contains all that an agent would need to
+    produce an action, get_reward produces the reward achieved over the last time step, and time_step simulates
+    the environment for some time, until the next action is required.
+
+    We simulate an arbitrary number of games at the same time, and because everything is a pytorch array, we
+    can easily send everything to GPU to compute there.
+
     For simplicity we will discretise the possible action space of our robot. At each time step it will have the
     following actions:
     - 9 possible choices of acceleration: either 0, or a constant in one of 8 directions
@@ -29,7 +37,7 @@ class RobocupEnv:
         # game constants
         self.L_x = 10.4                # Length of field in meters
         self.L_y = 7.4                 # Width of field in meters
-        self.ball_diam = 0.043         # diameter of playing ball, in meters, NOT USED RIGHT NOW
+        self.ball_diam = 0.043         # diameter of playing ball, in kg, NOT USED RIGHT NOW
         self.ball_mass = 0.046         # mass of playing ball, in meters, NOT USED RIGHT NOW
 
         # robot constants
@@ -94,16 +102,18 @@ class RobocupEnv:
         """
         :return: should return the state suitable for passing to our model for action prediction
 
-        this function should return the state that we will pass to the neural network to make decisions
-        for all players.
+        The compliation with this function is that we have 2*self.team_size players in total, and we need our
+        agent to take decisions on behalf of all those players. Yet for each of those players, the agent also
+        requires information about the teammates and opponents. This means that each of the two outputs
+        of get_state will have shape [n_games, team_size, 16*(1+team_size)]. This outputs the state for every
+        player in every game we simulate, a state which has size 16*(1+team_size)
 
-        It should include
+        These 16*(1+team_size) numbers include the following:
+
         1. the position and velocity of the ball at t_n and t_(n-1)
         2. the position and velocity of the controlled agent at t_n and t_(n-1)
         3. the position and velocity of teammates (including itself) at t_n and t_(n-1)
         4. the position and velocity of opponents at t_n and t_(n-1)
-
-        our total state size is 16*(1+self.team_size)
 
         """
         # these are here as convenient reminders of the sizes of useful tensors
@@ -150,6 +160,10 @@ class RobocupEnv:
 
         assert state_team_A.shape == t.Size([self.n_games, self.team_size, 2*(2*(2+2*self.team_size))])
 
+        # only passing the current position and velocity is not sufficient (Markov property not respected)
+        # the agent needs to have second order information, and we achieve this by including the positions
+        # and velocities at the previous simulation time, inside the state. That's what the following code is
+        # achieving.
         if self.prev_state_team_A is None:
             full_state_team_A = t.cat([state_team_A, state_team_A], dim=2)
         else:
@@ -164,15 +178,26 @@ class RobocupEnv:
         self.prev_state_team_A = state_team_A.clone()
         self.prev_state_team_B = state_team_B.clone()
 
+        # return the state for each team
         return full_state_team_A, full_state_team_B
 
     def get_episode_history(self):
+
         pass
 
     def save_episode_to_file(self):
         pass
 
     def compute_accel_from_actions(self, actions):
+        """
+        :param actions:
+        :return: nothing
+        -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        Function that takes the actions of our agent in one-hot format and converts them to accelerations in one of
+        8 directions (plus the action of no acceleration), stored in self.accel_agents
+        """
 
         assert self.accel_agents.shape == t.Size([self.n_games, 2 * self.team_size, 2])
         assert self.accel_ball.shape == t.Size([self.n_games, 1, 2])
@@ -190,20 +215,31 @@ class RobocupEnv:
         self.accel_agents[:, :, 1:2] += self.accel * (1.0 - no_accel_actions) * (
             t.sin(2 * np.pi * t.argmax(accel_actions, dim=2, keepdim=True) / 8))
 
-        # cap velocity for agents
+        # find velocity norms and the indices where the speeds exceed the max allowable speed
         vel_agents_norm = t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7
-        speed_violations = vel_agents_norm > self.max_speed
+        speed_violations = vel_agents_norm > self.max_speed  # this is a tensor of booleans
 
+        # cap velocity for agents with a mask based on speed_violations
         self.vel_agents = self.vel_agents * t.logical_not(speed_violations).float() + (
                 self.max_speed * self.vel_agents / vel_agents_norm * speed_violations.float())
 
     def kick_force_tracking(self, actions):
+        """
+        :param actions:
+        :return:
+        -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        The way our agents "kick" the ball is by temporarily increase the repulsive force between the ball and the
+        kicking agent. Yet this increase in force is temporary, and decreases exponentially in time. In this function
+        we're implementing this exponential decrease in time and figuring our which robots are allowed to kick again
+        from the actions passed to us by the model.
+        """
 
         # our halflife is self.kick_halflife
         # we want it to decrease like 0.5^(t/halflife) = e^(-ln(2) * t/halflife)
         # this way we automatically adjust the exponential decrease if we change self.sim_delta_t
         alpha = np.exp(-np.log(2.0) * self.sim_delta_t / self.kick_halflife)
-
         self.kick_tracking *= alpha
 
         # extract the kick action from the overall actions tensor
@@ -217,6 +253,16 @@ class RobocupEnv:
         assert self.kick_tracking.shape == t.Size([self.n_games, 2 * self.team_size, 1])
 
     def robot_robot_repulsion(self):
+        """
+        :return:
+         -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        The way we implement collisions between agents right now is to have every agent repel every other agent
+        with a force proportional to 1/distance^2 (the specific form of the potential is arbitrary and easy to
+        change to make it resemble a real "hard bounce"). This function is accomplishing the critical task of
+        updating self.accel_agents given this repulsion effect.
+        """
         # now this is a tensor of size [n_games, 2*team_size, 2*team_size, 2]
         # which is simply pos_agents copied 2*n_player times along dim=2
         pos_expanded = self.pos_agents.unsqueeze(2).repeat(1, 1, 2 * self.team_size, 1)
@@ -244,6 +290,14 @@ class RobocupEnv:
         self.accel_agents += net_agent_forces
 
     def robot_ball_repulsion(self):
+        """
+        :return:
+         -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        Very similar to robot_robot_repulsion above, with the added complexity of keeping track of our "kicked"
+        interactions.
+        """
         ball_pos_diff = self.pos_ball - self.pos_agents  # size = [n_games, 2*team_size, 2]
         assert ball_pos_diff.shape == t.Size([self.n_games, 2 * self.team_size, 2])
 
@@ -251,6 +305,7 @@ class RobocupEnv:
         ball_distances = t.norm(ball_pos_diff, dim=2, keepdim=True) + 1e-7  # size = [n_games, 2*team_size, 1]
         assert ball_distances.shape == t.Size([self.n_games, 2 * self.team_size, 1])
 
+        # computing the forces on the ball from the repulsion from all 2*team_size agents
         ball_force_norms = self.k_repul_baseline * (1 + self.kick_tracking) / ball_distances ** 2
         net_ball_forces = t.sum(ball_pos_diff * ball_force_norms / ball_distances, dim=1, keepdim=True)
 
@@ -260,6 +315,14 @@ class RobocupEnv:
         self.accel_ball += net_ball_forces
 
     def robot_ball_friction(self):
+        """
+        :return:
+         -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        Computes the acceleration from friction with the ground for both the ball and the agents, then adds it
+        to the acceleration tensors.
+        """
         # decrease acceleration in line with the velocity
         self.accel_agents -= self.friction_coeff_wheels * self.g * \
                              self.vel_agents / (t.norm(self.vel_agents, dim=2, keepdim=True) + 1e-7)
@@ -268,9 +331,22 @@ class RobocupEnv:
                            self.vel_ball / (t.norm(self.vel_ball, dim=1, keepdim=True) + 1e-7)
 
     def wall_collisions(self):
+        """
+        :return:
+
+         -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        updates the velocity tensors self.vel_agents and self.vel_balls in order to reflect bounces from
+        walls. Essentially the x or y components of the velocity are reversed when we hit a wall in their respective
+        components. The only complication is that we also need to ensure that we set the position of the agent
+        exactly at the edge of the wall, otherwise the velocity might keep flipping at every time-step as the
+        agent gets "stuck" behind the wall.
+        """
         # on the first loop this does agent robot-wall collisions, and on the second ball-wall collisions
 
         for pos, vel in zip([self.pos_agents, self.pos_ball], [self.vel_agents, self.vel_ball]):
+            # tensors of booleans corresponding to the indices where agents are out of bounds
             x_outbound_left = (pos[:, :, 0:1] < 0)
             x_outbound_right = (pos[:, :, 0:1] > self.L_x)
             y_outbound_bottom = (pos[:, :, 1:2] < 0)
@@ -289,14 +365,24 @@ class RobocupEnv:
             y_up_indices = t.cat([zeros_temp, y_outbound_up], dim=2)
             y_down_indices = t.cat([zeros_temp, y_outbound_bottom], dim=2)
 
+            # reverse all velocities at those locations where outbounds_bool is true
             vel *= (-1) ** outbounds_bools
 
+            # make sure to set the positions after a wall collision at the wall itself.
             pos[x_left_indices] = 0.0
             pos[x_right_indices] = self.L_x
             pos[y_down_indices] = 0.0
             pos[y_up_indices] = self.L_y
 
     def pos_vel_update(self):
+        """
+        :return:
+        -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        Implement the definitions of velocity and acceleration. At each time step the position is incremented by
+        the velocity and the velocity is incremented by the acceleration.
+        """
 
         # increment position from velocity
         self.pos_agents += self.sim_delta_t * self.vel_agents
@@ -307,7 +393,26 @@ class RobocupEnv:
         self.vel_ball += self.sim_delta_t * self.accel_ball
 
     def get_reward(self):
+        """
+        :return:
+         -------------------------------------
+        ONLY CALLED FROM RobocupEnv.time_step
+        -------------------------------------
+        produces the reward from the last time step for both team A and team B.
+        This reward is the decrease in  1/(distance between ball and opposite goal) minus the decrease
+        in 1/(distance between ball and own goal) at each time step.
+        The idea is to reward making the ball get closer to the opponent goal, and penalise the ball getting
+        close to our goal. Making the reward just the number of goals is much too sparse, and the agent will
+        have trouble learning anything.
 
+        The clever thing here is that the 1/distance reward will still reward goals more than any weird mid-field
+        maneuvers, because a goal is worth infinite points (that in practice we cap), so there's no need to worry
+        that our crafted reward doens't match what we actually want.
+        """
+
+        # goal of A is at (0, L_y/2) and goal of B is at (L_x, L_y/2), these compute the distances
+        # between the ball and these points. Given that the goal is really a finite segment, we really should compute
+        # the minimum distance between the ball and any point of the goal, but this was easier.
         new_ball_goal_dist_team_A = ((self.pos_ball[:, :, 0] ** 2 +
                                       (self.pos_ball[:, :, 1] - self.L_y / 2) ** 2) ** 0.5).squeeze()
         new_ball_goal_dist_team_B = (((self.pos_ball[:, :, 0] - self.L_x) ** 2 +
@@ -315,15 +420,16 @@ class RobocupEnv:
         assert new_ball_goal_dist_team_A.shape == t.Size([self.n_games])
         assert new_ball_goal_dist_team_B.shape == t.Size([self.n_games])
 
+        # the differences in 1/ball_goal_distance from previous time step
         goal_team_A = 1.0 / new_ball_goal_dist_team_A - 1.0 / self.ball_goal_dist_team_A
         goal_team_B = 1.0 / new_ball_goal_dist_team_B - 1.0 / self.ball_goal_dist_team_B
 
         self.ball_goal_dist_team_A = new_ball_goal_dist_team_A
         self.ball_goal_dist_team_B = new_ball_goal_dist_team_B
 
+        # return rewards for each team
         reward_team_A = goal_team_A - goal_team_B
         reward_team_B = -reward_team_A
-
         return reward_team_A, reward_team_B
 
     def time_step(self, actions, verbose=False):
@@ -332,8 +438,6 @@ class RobocupEnv:
             we assume that actions is a tensor of size [n_games, 2*team_size, 10]
             the first 9 numbers in dim=2 are a one-hot encoding of the acceleration direction, the last
             number is assumed to either be 1 or 0, corresponding to the kick decision
-        :param new_action_bool: boolean that states if we are doing a simulation step in which new actions
-            are given by the model, or not
         :return reward_team_A: the rewards for team A, the team B rewards are the negatives of that.
         """
 
